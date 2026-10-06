@@ -3,7 +3,7 @@
 ## 로컬 실행
     pip install -r requirements.txt
     python app.py
-http://localhost:5000 접속 후 클립 주소 입력.
+https://chzzk-clip-downloader.onrender.com/ 접속 후 클립 주소 입력.
 
 ## 배포 (Render 등)
 - Build: `pip install -r requirements.txt`
