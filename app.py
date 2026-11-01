@@ -34,13 +34,23 @@ GATED = bool(SITE_PASSWORD or NAVER_OAUTH)                       # 로그인 화
 CAN_LOGIN = bool(SITE_PASSWORD or (NAVER_OAUTH and ALLOWED_NAVER_IDS))  # 실제로 입장 가능한 수단이 있는지
 NID_AUT = os.environ.get("NID_AUT", "")
 NID_SES = os.environ.get("NID_SES", "")
-COOKIE_FILE = os.path.join(tempfile.gettempdir(), "chzzk_cookies.json")
+USER_DIR = os.path.join(tempfile.gettempdir(), "chzzk_users")
+CID_RE = re.compile(r"^[A-Za-z0-9_-]{24,64}$")
 COOKIE_RE = re.compile(r'^[^\s;,"\'\\]{8,1500}$')
+MAX_USERS = 500
+
+
+def _user_file():
+    cid = request.cookies.get("cid", "")
+    return os.path.join(USER_DIR, cid + ".json") if CID_RE.match(cid) else None
 
 
 def _file_cookies():
+    p = _user_file()
+    if not p:
+        return {}
     try:
-        with open(COOKIE_FILE, encoding="utf-8") as f:
+        with open(p, encoding="utf-8") as f:
             d = json.load(f)
         if d.get("NID_AUT") and d.get("NID_SES"):
             return {"NID_AUT": d["NID_AUT"], "NID_SES": d["NID_SES"]}
@@ -50,12 +60,10 @@ def _file_cookies():
 
 
 def cookie_source():
-    """'form'(사이트에서 입력) / 'env'(환경 변수) / None. 로그인 보호가 없으면 항상 None."""
-    if not CAN_LOGIN:
-        return None
+    """'form'(이 브라우저에서 입력) / 'env'(환경 변수, 로그인 보호가 켜진 경우만) / None."""
     if _file_cookies():
         return "form"
-    return "env" if NID_AUT and NID_SES else None
+    return "env" if CAN_LOGIN and NID_AUT and NID_SES else None
 
 
 def auth_cookies():
@@ -300,60 +308,75 @@ button.f{background:var(--accent);color:#04251a;font-weight:700;border:0;cursor:
 
 
 ADULT_MSGS = {"saved": "쿠키를 등록했어요. 연령 제한 클립을 불러와 확인해 보세요.",
-              "deleted": "입력한 쿠키를 삭제했어요.",
+              "deleted": "등록한 쿠키를 삭제했어요.",
               "invalid": "쿠키 형식이 올바르지 않아요. 값만 정확히 붙여넣어 주세요.",
-              "csrf": "요청이 만료됐어요. 다시 시도해 주세요.",
-              "disabled": "접속 비밀번호나 네이버 로그인 설정이 있어야 쿠키를 등록할 수 있어요."}
+              "csrf": "요청이 올바르지 않아요. 다시 시도해 주세요.",
+              "full": "서버 저장 공간이 가득 찼어요. 나중에 다시 시도해 주세요."}
 
 
 @app.get("/adult")
 def adult():
     src = cookie_source()
     if src == "form":
-        status = '<span class="ok">● 성인 인증 쿠키가 등록돼 있어요. (사이트에서 입력)</span><div class="mute">연령 제한 클립을 받을 수 있어요. 안 되면 쿠키가 만료됐을 수 있어요.</div>'
+        status = '<span class="ok">● 이 브라우저에 성인 인증 쿠키가 등록돼 있어요.</span><div class="mute">연령 제한 클립을 받을 수 있어요. 안 되면 쿠키가 만료됐을 수 있어요.</div>'
     elif src == "env":
-        status = '<span class="ok">● 성인 인증 쿠키가 등록돼 있어요. (환경 변수)</span><div class="mute">아래에서 새 값을 등록하면 그 값이 우선 사용돼요.</div>'
+        status = '<span class="ok">● 성인 인증 쿠키가 등록돼 있어요. (서버 환경 변수)</span><div class="mute">아래에서 새 값을 등록하면 그 값이 우선 사용돼요.</div>'
     else:
         status = '<span class="no">● 쿠키가 등록되지 않았어요.</span><div class="mute">아래 입력칸에 쿠키를 등록하면 연령 제한 클립을 받을 수 있어요.</div>'
     msg = ADULT_MSGS.get(request.args.get("m", ""), "")
     msg = f'<div class="note">{html.escape(msg)}</div>' if msg else ""
-    if CAN_LOGIN:
-        tok = session.setdefault("csrf", secrets.token_urlsafe(16))
-        form = ('<div class="card"><h2>쿠키 등록</h2>'
-                '<form method="post" action="/adult/cookies" autocomplete="off">'
-                f'<input type="hidden" name="t" value="{html.escape(tok)}">'
-                '<input class="f" type="password" name="NID_AUT" placeholder="NID_AUT 값" autocomplete="off" required>'
-                '<input class="f" type="password" name="NID_SES" placeholder="NID_SES 값" autocomplete="off" required>'
-                '<button class="f" name="action" value="save">등록</button>'
-                '<button class="f del" name="action" value="delete" formnovalidate>입력한 쿠키 삭제</button></form>'
-                '<div class="mute" style="margin-top:8px">서버 임시 저장소에 보관되고, 서버가 재시작·재배포되면 사라져요. 등록한 값은 화면에 다시 표시되지 않아요.</div></div>')
-    else:
-        form = '<div class="card"><h2>쿠키 등록</h2><div class="mute">접속 비밀번호 또는 네이버 로그인 설정을 먼저 해야 쿠키를 등록할 수 있어요. (보호 없이 열린 사이트에서 내 쿠키가 쓰이는 것을 막기 위해서예요.)</div></div>'
+    form = ('<div class="card"><h2>쿠키 등록</h2>'
+            '<form method="post" action="/adult/cookies" autocomplete="off">'
+            '<input class="f" type="password" name="NID_AUT" placeholder="NID_AUT 값" autocomplete="off" required>'
+            '<input class="f" type="password" name="NID_SES" placeholder="NID_SES 값" autocomplete="off" required>'
+            '<button class="f" name="action" value="save">등록</button>'
+            '<button class="f del" name="action" value="delete" formnovalidate>등록한 쿠키 삭제</button></form>'
+            '<div class="mute" style="margin-top:8px">이 브라우저에서만 사용돼요. 서버가 재시작·재배포되면 사라지고, 등록한 값은 화면에 다시 표시되지 않아요. '
+            '반드시 <b>본인 계정</b>의 쿠키만 입력하세요.</div></div>')
     page = ADULT_HTML.replace("{{status}}", status).replace("{{msg}}", msg).replace("{{form}}", form)
     return Response(page, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
 
 @app.post("/adult/cookies")
 def adult_cookies():
-    if not CAN_LOGIN:
-        return redirect("/adult?m=disabled")
-    tok = session.get("csrf", "")
-    if not tok or not hmac.compare_digest(tok, request.form.get("t", "")):
+    origin = request.headers.get("Origin")
+    if origin and urlparse(origin).netloc != request.host:
         return redirect("/adult?m=csrf")
+    cid = request.cookies.get("cid", "")
+    fresh = not CID_RE.match(cid)
     if request.form.get("action") == "delete":
-        try:
-            os.remove(COOKIE_FILE)
-        except OSError:
-            pass
+        p = _user_file()
+        if p:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
         return redirect("/adult?m=deleted")
     aut = clean_cookie(request.form.get("NID_AUT"), "NID_AUT")
     ses = clean_cookie(request.form.get("NID_SES"), "NID_SES")
     if not (COOKIE_RE.match(aut) and COOKIE_RE.match(ses)):
         return redirect("/adult?m=invalid")
-    fd = os.open(COOKIE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.makedirs(USER_DIR, mode=0o700, exist_ok=True)
+    now = time.time()
+    names = os.listdir(USER_DIR)
+    for n in names:  # 30일 지난 파일 정리
+        fp = os.path.join(USER_DIR, n)
+        try:
+            if now - os.path.getmtime(fp) > 30 * 86400:
+                os.remove(fp)
+        except OSError:
+            pass
+    if fresh:
+        if len(os.listdir(USER_DIR)) >= MAX_USERS:
+            return redirect("/adult?m=full")
+        cid = secrets.token_urlsafe(24)
+    fd = os.open(os.path.join(USER_DIR, cid + ".json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump({"NID_AUT": aut, "NID_SES": ses}, f)
-    return redirect("/adult?m=saved")
+    resp = redirect("/adult?m=saved")
+    resp.set_cookie("cid", cid, max_age=30 * 86400, httponly=True, samesite="Lax",
+                    secure=os.environ.get("RENDER") == "true")
+    return resp
 
 
 @app.get("/")
