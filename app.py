@@ -4,9 +4,11 @@
 import hashlib
 import hmac
 import html
+import json
 import os
 import re
 import secrets
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from urllib.parse import quote, urlencode, urlparse
@@ -32,8 +34,46 @@ GATED = bool(SITE_PASSWORD or NAVER_OAUTH)                       # 로그인 화
 CAN_LOGIN = bool(SITE_PASSWORD or (NAVER_OAUTH and ALLOWED_NAVER_IDS))  # 실제로 입장 가능한 수단이 있는지
 NID_AUT = os.environ.get("NID_AUT", "")
 NID_SES = os.environ.get("NID_SES", "")
-AUTH_COOKIES = ({"NID_AUT": NID_AUT, "NID_SES": NID_SES}
-                if CAN_LOGIN and NID_AUT and NID_SES else {})
+COOKIE_FILE = os.path.join(tempfile.gettempdir(), "chzzk_cookies.json")
+COOKIE_RE = re.compile(r'^[^\s;,"\'\\]{8,1500}$')
+
+
+def _file_cookies():
+    try:
+        with open(COOKIE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("NID_AUT") and d.get("NID_SES"):
+            return {"NID_AUT": d["NID_AUT"], "NID_SES": d["NID_SES"]}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def cookie_source():
+    """'form'(사이트에서 입력) / 'env'(환경 변수) / None. 로그인 보호가 없으면 항상 None."""
+    if not CAN_LOGIN:
+        return None
+    if _file_cookies():
+        return "form"
+    return "env" if NID_AUT and NID_SES else None
+
+
+def auth_cookies():
+    src = cookie_source()
+    if src == "form":
+        return _file_cookies()
+    if src == "env":
+        return {"NID_AUT": NID_AUT, "NID_SES": NID_SES}
+    return {}
+
+
+def clean_cookie(v, name):
+    v = (v or "").strip().strip(";").strip()
+    if v.upper().startswith(name + "="):
+        v = v[len(name) + 1:]
+    return v.strip().strip(";").strip()
+
+
 app.secret_key = os.environ.get("SECRET_KEY") or hashlib.sha256(
     ("chzzk-dl|" + SITE_PASSWORD + NAVER_CLIENT_SECRET).encode()).hexdigest()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
@@ -96,7 +136,7 @@ def host_allowed(url: str) -> bool:
 
 
 def get_json(url):
-    r = requests.get(url, headers=HEADERS, cookies=AUTH_COOKIES or None, timeout=10)
+    r = requests.get(url, headers=HEADERS, cookies=auth_cookies() or None, timeout=10)
     r.raise_for_status()
     return r.json()
 
@@ -130,7 +170,7 @@ def parse_mpd(xml_text):
 def fetch_playback(video_id, in_key):
     r = requests.get(PLAYBACK.format(video_id, in_key or ""),
                      headers={**HEADERS, "Accept": "application/dash+xml"},
-                     cookies=AUTH_COOKIES or None, timeout=10)
+                     cookies=auth_cookies() or None, timeout=10)
     r.raise_for_status()
     return r.text
 
@@ -239,32 +279,81 @@ main{max-width:520px;margin:5vh auto}h1{font-size:1.4rem;margin:0 0 14px}
 .card h2{font-size:1rem;margin:0 0 6px}.mute{color:var(--mute);font-size:.9rem}
 .ok{color:var(--ok);font-weight:700}.no{color:var(--err);font-weight:700}
 a.btn{display:block;background:var(--accent);color:#04251a;font-weight:700;text-align:center;text-decoration:none;border-radius:10px;padding:12px;margin-top:8px}
-a.sub{display:inline-block;color:var(--mute);margin-top:6px}ol{padding-left:20px;margin:6px 0}</style></head><body><main>
-<h1>연령 제한 클립 · 성인 인증</h1>
+a.sub{display:inline-block;color:var(--mute);margin-top:6px}.note{padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card);margin-bottom:12px;font-size:.92rem}
+input.f,button.f{display:block;width:100%;font:inherit;padding:12px;border-radius:10px;border:1px solid var(--line);margin-top:8px;background:var(--bg);color:inherit}
+button.f{background:var(--accent);color:#04251a;font-weight:700;border:0;cursor:pointer}button.f.del{background:transparent;color:var(--err);border:1px solid var(--line);font-weight:400}ol{padding-left:20px;margin:6px 0}</style></head><body><main>
+<h1>연령 제한 클립 · 성인 인증</h1>{{msg}}
 <div class="card"><h2>현재 상태</h2>{{status}}</div>
+{{form}}
 <div class="card"><h2>1. 네이버에서 성인 인증 받기</h2>
 <div class="mute">성인 인증은 네이버가 직접 처리해요. 이 사이트에서는 인증을 대신할 수 없어요. 실명 확인된 계정으로 성인 인증을 마쳐주세요.</div>
 <a class="btn" href="https://chzzk.naver.com" target="_blank" rel="noopener">치지직 열기 (연령 제한 클립에서 인증 안내 확인)</a>
 <a class="btn" href="https://help.naver.com" target="_blank" rel="noopener">네이버 고객센터</a></div>
-<div class="card"><h2>2. 인증된 계정의 쿠키를 사이트에 등록</h2>
+<div class="card"><h2>2. 쿠키 값 가져오기</h2>
 <ol><li>컴퓨터 크롬에서 인증된 계정으로 naver.com 로그인</li>
 <li><b>F12</b> → <b>Application</b> → <b>Cookies</b> → naver.com</li>
 <li><b>NID_AUT</b>, <b>NID_SES</b> 값을 복사</li>
-<li>Render → Environment 에 같은 이름으로 입력하고 저장</li></ol>
+<li>위 입력칸에 붙여넣고 등록 (또는 Render 환경 변수에 입력)</li></ol>
 <div class="mute">쿠키는 비밀번호와 같아요. 채팅이나 GitHub에는 올리지 마세요. 만료되면 새 값으로 바꿔주세요.</div></div>
 <a class="btn" href="/">클립 다운로드 화면으로</a>
 </main></body></html>"""
 
 
+ADULT_MSGS = {"saved": "쿠키를 등록했어요. 연령 제한 클립을 불러와 확인해 보세요.",
+              "deleted": "입력한 쿠키를 삭제했어요.",
+              "invalid": "쿠키 형식이 올바르지 않아요. 값만 정확히 붙여넣어 주세요.",
+              "csrf": "요청이 만료됐어요. 다시 시도해 주세요.",
+              "disabled": "접속 비밀번호나 네이버 로그인 설정이 있어야 쿠키를 등록할 수 있어요."}
+
+
 @app.get("/adult")
 def adult():
-    if AUTH_COOKIES:
-        status = '<span class="ok">● 성인 인증 쿠키가 등록돼 있어요.</span><div class="mute">연령 제한 클립을 받을 수 있어요. 안 되면 쿠키가 만료됐을 수 있어요.</div>'
-    elif NID_AUT and NID_SES:
-        status = '<span class="no">● 쿠키는 있지만 사용되지 않아요.</span><div class="mute">보호를 위해 접속 비밀번호나 네이버 로그인 설정이 있어야 쿠키가 쓰여요.</div>'
+    src = cookie_source()
+    if src == "form":
+        status = '<span class="ok">● 성인 인증 쿠키가 등록돼 있어요. (사이트에서 입력)</span><div class="mute">연령 제한 클립을 받을 수 있어요. 안 되면 쿠키가 만료됐을 수 있어요.</div>'
+    elif src == "env":
+        status = '<span class="ok">● 성인 인증 쿠키가 등록돼 있어요. (환경 변수)</span><div class="mute">아래에서 새 값을 등록하면 그 값이 우선 사용돼요.</div>'
     else:
-        status = '<span class="no">● 쿠키가 등록되지 않았어요.</span><div class="mute">아래 순서대로 등록하면 연령 제한 클립을 받을 수 있어요.</div>'
-    return ADULT_HTML.replace("{{status}}", status)
+        status = '<span class="no">● 쿠키가 등록되지 않았어요.</span><div class="mute">아래 입력칸에 쿠키를 등록하면 연령 제한 클립을 받을 수 있어요.</div>'
+    msg = ADULT_MSGS.get(request.args.get("m", ""), "")
+    msg = f'<div class="note">{html.escape(msg)}</div>' if msg else ""
+    if CAN_LOGIN:
+        tok = session.setdefault("csrf", secrets.token_urlsafe(16))
+        form = ('<div class="card"><h2>쿠키 등록</h2>'
+                '<form method="post" action="/adult/cookies" autocomplete="off">'
+                f'<input type="hidden" name="t" value="{html.escape(tok)}">'
+                '<input class="f" type="password" name="NID_AUT" placeholder="NID_AUT 값" autocomplete="off" required>'
+                '<input class="f" type="password" name="NID_SES" placeholder="NID_SES 값" autocomplete="off" required>'
+                '<button class="f" name="action" value="save">등록</button>'
+                '<button class="f del" name="action" value="delete" formnovalidate>입력한 쿠키 삭제</button></form>'
+                '<div class="mute" style="margin-top:8px">서버 임시 저장소에 보관되고, 서버가 재시작·재배포되면 사라져요. 등록한 값은 화면에 다시 표시되지 않아요.</div></div>')
+    else:
+        form = '<div class="card"><h2>쿠키 등록</h2><div class="mute">접속 비밀번호 또는 네이버 로그인 설정을 먼저 해야 쿠키를 등록할 수 있어요. (보호 없이 열린 사이트에서 내 쿠키가 쓰이는 것을 막기 위해서예요.)</div></div>'
+    page = ADULT_HTML.replace("{{status}}", status).replace("{{msg}}", msg).replace("{{form}}", form)
+    return Response(page, mimetype="text/html", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/adult/cookies")
+def adult_cookies():
+    if not CAN_LOGIN:
+        return redirect("/adult?m=disabled")
+    tok = session.get("csrf", "")
+    if not tok or not hmac.compare_digest(tok, request.form.get("t", "")):
+        return redirect("/adult?m=csrf")
+    if request.form.get("action") == "delete":
+        try:
+            os.remove(COOKIE_FILE)
+        except OSError:
+            pass
+        return redirect("/adult?m=deleted")
+    aut = clean_cookie(request.form.get("NID_AUT"), "NID_AUT")
+    ses = clean_cookie(request.form.get("NID_SES"), "NID_SES")
+    if not (COOKIE_RE.match(aut) and COOKIE_RE.match(ses)):
+        return redirect("/adult?m=invalid")
+    fd = os.open(COOKIE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"NID_AUT": aut, "NID_SES": ses}, f)
+    return redirect("/adult?m=saved")
 
 
 @app.get("/")
@@ -283,7 +372,7 @@ def info():
     video_id = play.get("videoId") or detail.get("videoId")
     if not video_id:
         msg = ("클립을 찾을 수 없어요. 삭제·비공개이거나 로그인 쿠키가 만료됐을 수 있어요."
-               if AUTH_COOKIES else
+               if auth_cookies() else
                "클립을 찾을 수 없어요. 삭제·비공개이거나 성인 인증이 필요한 클립일 수 있어요.")
         return jsonify(error=msg), 404
     try:
@@ -327,7 +416,7 @@ def debug():
         abort(400)
     play = safe_json(CLIP_INFO.format(m.group(1)))
     detail = safe_json(CLIP_DETAIL.format(m.group(1)))
-    out = {"cookies_configured": bool(AUTH_COOKIES), "play_keys": sorted(play), "detail_keys": sorted(detail),
+    out = {"cookies_configured": bool(auth_cookies()), "play_keys": sorted(play), "detail_keys": sorted(detail),
            "thumbnail_raw": detail.get("thumbnailImageUrl")}
     try:
         xml_text = fetch_playback(play.get("videoId") or detail.get("videoId"), play.get("inKey"))
